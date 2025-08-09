@@ -1244,7 +1244,7 @@ impl App {
             DeviceUpdate::ConnectedEvent(id) => {
                 if self.sub_state == SubState::ConnectingForCharacteristics {
                     self.sub_state = SubState::CharacteristicView;
-                } else {
+                } else if self.sub_state == SubState::ConnectingForHeartRate {
                     // If it wasn't for characteristics, it's probably for HR
                     self.view = AppView::HeartRateView;
                 }
