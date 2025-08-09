@@ -32,7 +32,6 @@ use crate::vrcx::VrcxStartup;
 use crate::widgets::prompts::SavePromptChoice;
 use crate::{
     heart_rate::ble::start_notification_thread,
-    heart_rate::miband::start_miband_monitor_thread,
     heart_rate::HeartRateStatus,
     logging::file_logging_thread,
     osc::osc_thread,
@@ -592,38 +591,18 @@ impl App {
         let rr_ignore_after_empty = self.settings.ble.rr_ignore_after_empty as usize;
         debug!("Spawning notification thread, AppView: {:?}", self.view);
 
-        // Check if the device is a MiBand
-        let is_miband = device.name.contains("Mi Band");
-
-        if is_miband {
-            debug!("Detected MiBand device, using MiBand monitor");
-            self.hr_thread_handle = Some(tokio::spawn(async move {
-                start_miband_monitor_thread(
-                    hr_tx_clone,
-                    restart_tx_clone,
-                    device,
-                    rr_ignore_after_empty,
-                    rr_twitch_threshold,
-                    ble_packet_timeout,
-                    shutdown_requested_clone,
-                );
-                // Return unit type to match the other branch
-                ()
-            }));
-        } else {
-            self.hr_thread_handle = Some(tokio::spawn(async move {
-                start_notification_thread(
-                    hr_tx_clone,
-                    restart_tx_clone,
-                    device,
-                    rr_ignore_after_empty,
-                    rr_twitch_threshold,
-                    ble_packet_timeout,
-                    shutdown_requested_clone,
-                )
-                .await
-            }));
-        }
+        self.hr_thread_handle = Some(tokio::spawn(async move {
+            start_notification_thread(
+                hr_tx_clone,
+                restart_tx_clone,
+                device,
+                rr_ignore_after_empty,
+                rr_twitch_threshold,
+                ble_packet_timeout,
+                shutdown_requested_clone,
+            )
+            .await
+        }));
     }
 
     fn is_device_saved(&self, given_device: Option<&DeviceInfo>) -> bool {
