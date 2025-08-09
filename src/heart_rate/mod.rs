@@ -2,6 +2,7 @@ pub mod ble;
 pub mod dummy;
 pub mod measurement;
 pub mod websocket;
+pub mod miband;
 
 mod twitcher;
 
