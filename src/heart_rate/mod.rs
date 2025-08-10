@@ -3,6 +3,7 @@ pub mod dummy;
 pub mod measurement;
 pub mod websocket;
 pub mod miband;
+pub mod constants;
 
 mod twitcher;
 

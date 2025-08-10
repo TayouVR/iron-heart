@@ -1,9 +1,9 @@
-use super::{BatteryLevel, HeartRateStatus};
+use super::{constants::BLE_UUIDS, BatteryLevel, HeartRateStatus};
 use crate::app::{AppUpdate, ErrorPopup};
 use crate::errors::AppError;
 use crate::structs::DeviceInfo;
 
-use btleplug::api::{Characteristic, Peripheral, ValueNotification, WriteType};
+use btleplug::api::{Characteristic, Peripheral, ValueNotification};
 use futures::{Stream, StreamExt};
 use std::pin::Pin;
 use std::time::Duration;
@@ -11,24 +11,15 @@ use tokio::sync::broadcast::Sender as BSender;
 use tokio::sync::mpsc::Sender;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
-use uuid::Uuid;
 
 use crate::broadcast;
 
 use super::measurement::parse_hrm;
-use super::miband::{self, MiBandDevice, MiBandModel};
+use super::miband::{self, MiBandDevice};
 use super::twitcher::Twitcher;
 
-pub const HEART_RATE_SERVICE_UUID: Uuid = Uuid::from_u128(0x0000180d_0000_1000_8000_00805f9b34fb); // 0000180d-0000-1000-8000-00805f9b34fb
-pub const HEART_RATE_MEASUREMENT_CHARACTERISTIC_UUID: Uuid =
-    Uuid::from_u128(0x00002a37_0000_1000_8000_00805f9b34fb); // 00002a37-0000-1000-8000-00805f9b34fb
-
-//pub const BATTERY_SERVICE_UUID: Uuid = Uuid::from_u128(0x0000180f_0000_1000_8000_00805f9b34fb); // 0000180f-0000-1000-8000-00805f9b34fb
-pub const BATTERY_LEVEL_CHARACTERISTIC_UUID: Uuid =
-    Uuid::from_u128(0x00002a19_0000_1000_8000_00805f9b34fb); // 00002a19-0000-1000-8000-00805f9b34fb
-
 struct BleMonitorActor {
-    peripheral: DeviceInfo,
+    device_info: DeviceInfo,
     rr_cooldown_amount: usize,
     no_packet_timeout: Duration,
     battery_characteristic: Option<Characteristic>,
@@ -50,8 +41,8 @@ impl BleMonitorActor {
         restart_tx: Sender<()>,
     ) -> Result<(), AppError> {
         'connection: loop {
-            let device = self
-                .peripheral
+            let peripheral = self
+                .device_info
                 .device
                 .clone()
                 .expect("Missing device object?");
@@ -60,33 +51,33 @@ impl BleMonitorActor {
             }
             info!(
                 "Connecting to Heart Rate Monitor! Name: {:?} | Address: {:?}",
-                self.peripheral.name, self.peripheral.address
+                self.device_info.name, self.device_info.address
             );
             tokio::select! {
-                conn_result = device.connect() => {
+                conn_result = peripheral.connect() => {
                     match conn_result {
                         Ok(_) => {
-                            if let Err(e) = device.discover_services().await {
+                            if let Err(e) = peripheral.discover_services().await {
                                 error!("Couldn't read services from connected device: {}", e);
                                 continue 'connection;
                             }
-                            let characteristics = device.characteristics();
+                            let characteristics = peripheral.characteristics();
                             let len = characteristics.len();
                             debug!("Found {len} characteristics");
                             // Save battery characteristic if present
                             if let Some(characteristic) = characteristics
                                 .iter()
-                                .find(|c| c.uuid == BATTERY_LEVEL_CHARACTERISTIC_UUID)
+                                .find(|c| c.uuid == BLE_UUIDS.characteristics.battery_level)
                             {
                                 self.battery_characteristic = Some(characteristic.to_owned());
-                                self.get_monitor_battery(&device).await;
+                                self.get_monitor_battery(&peripheral).await;
                             }
 
                             if let Some(miband_device) = &mut self.miband_device {
                                 // Authenticate the MiBand device
-                                if let Err(e) = miband_device.authenticate(&device).await {
+                                if let Err(e) = miband_device.authenticate(&peripheral).await {
                                     error!("MiBand authentication failed: {}", e);
-                                    device.disconnect().await?;
+                                    //peripheral.disconnect().await?;
                                     broadcast!(broadcast_tx, ErrorPopup::Intermittent(format!(
                                         "MiBand authentication failed: {e}"
                                     )));
@@ -94,9 +85,9 @@ impl BleMonitorActor {
                                 }
 
                                 // Start heart rate monitoring
-                                if let Err(e) = miband_device.start_heart_rate_monitor(&device, true).await {
+                                if let Err(e) = miband_device.start_heart_rate_monitor(&peripheral, true).await {
                                     error!("Failed to start heart rate monitoring: {}", e);
-                                    device.disconnect().await?;
+                                    //peripheral.disconnect().await?;
                                     broadcast!(broadcast_tx, ErrorPopup::Intermittent(format!(
                                         "Failed to start heart rate monitoring: {e}"
                                     )));
@@ -109,32 +100,32 @@ impl BleMonitorActor {
                             // Subscribe to heart rate notifications
                             if let Some(characteristic) = characteristics
                                 .iter()
-                                .find(|c| c.uuid == HEART_RATE_MEASUREMENT_CHARACTERISTIC_UUID)
+                                .find(|c| c.uuid == BLE_UUIDS.characteristics.heart_rate.measurement)
                             {
-                                if device.subscribe(characteristic).await.is_err() {
+                                if peripheral.subscribe(characteristic).await.is_err() {
                                     error!("Failed to subscribe to HR service!");
-                                    device.disconnect().await?;
+                                    peripheral.disconnect().await?;
                                     continue 'connection;
                                 }
                             } else {
                                 error!("Didn't find HR service during notification setup!");
-                                device.disconnect().await?;
+                                peripheral.disconnect().await?;
                                 continue 'connection;
                             }
 
-                            let notification_stream = match device.notifications().await {
+                            let notification_stream = match peripheral.notifications().await {
                                 Ok(stream) => stream,
                                 Err(e) => {
                                     error!("Failed to get HR BLE notification stream: {}", e);
-                                    device.disconnect().await?;
+                                    peripheral.disconnect().await?;
                                     continue 'connection;
                                 }
                             };
 
-                            self.notification_loop(broadcast_tx, notification_stream, &device).await?;
+                            self.notification_loop(broadcast_tx, notification_stream, &peripheral).await?;
 
                             info!("Heart Rate Monitor stream closed!");
-                            device.disconnect().await?;
+                            peripheral.disconnect().await?;
                             if self.cancel_token.is_cancelled() {
                                 break 'connection;
                             }
@@ -143,7 +134,7 @@ impl BleMonitorActor {
                             ));
                         }
                         Err(e) => {
-                            device.disconnect().await?;
+                            peripheral.disconnect().await?;
 
                             error!("BLE Connection error: {}", e);
                             broadcast!(broadcast_tx, ErrorPopup::Intermittent(format!(
@@ -165,8 +156,8 @@ impl BleMonitorActor {
                     }
                 }
                 _ = self.cancel_token.cancelled() => {
-                    if device.is_connected().await.unwrap_or(false) {
-                        device.disconnect().await?;
+                    if peripheral.is_connected().await.unwrap_or(false) {
+                        peripheral.disconnect().await?;
                     }
                     break 'connection;
                 }
@@ -197,16 +188,9 @@ impl BleMonitorActor {
                 Some(data) = notification_stream.next() => {
                     last_packet = std::time::Instant::now();
 
-                    if data.uuid == HEART_RATE_MEASUREMENT_CHARACTERISTIC_UUID {
+                    if data.uuid == BLE_UUIDS.characteristics.heart_rate.measurement {
                         let hr = self.handle_ble_hr(&data);
                         broadcast!(broadcast_tx, hr);
-                    } else if let Some(miband_device) = &self.miband_device {
-                        // Handle MiBand authentication notifications
-                        if data.uuid == miband::AUTH_CHARACTERISTIC_UUID {
-                            if let Err(e) = miband_device.handle_auth_notification(device, &data).await {
-                                error!("Error handling auth notification: {}", e);
-                            }
-                        }
                     }
                 }
                 _ = battery_checking_interval.tick() => {
@@ -270,7 +254,7 @@ impl BleMonitorActor {
 pub async fn start_notification_thread(
     broadcast_tx: BSender<AppUpdate>,
     restart_tx: Sender<()>,
-    peripheral: DeviceInfo,
+    device_info: DeviceInfo,
     rr_cooldown_amount: usize,
     twitch_threshold: f32,
     no_packet_timeout: Duration,
@@ -279,14 +263,14 @@ pub async fn start_notification_thread(
     let battery_level = BatteryLevel::NotReported;
 
     // Check if the device is a MiBand
-    let miband_device: Option<MiBandDevice> = if miband::is_miband(&peripheral) {
-        Option::from(MiBandDevice::new(peripheral.clone()))
+    let miband_device: Option<MiBandDevice> = if miband::is_miband(&device_info) {
+        Option::from(MiBandDevice::new(device_info.clone()))
     } else {
         None
     };
 
     let mut ble_monitor = BleMonitorActor {
-        peripheral,
+        device_info,
         no_packet_timeout,
         battery_characteristic: None,
         cancel_token,

@@ -3,68 +3,47 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use aes::Aes128;
-use btleplug::api::{Characteristic, Manager as _, Peripheral, ScanFilter, ValueNotification, WriteType};
-use btleplug::platform::{Manager, Peripheral as PlatformPeripheral};
+use btleplug::api::{Characteristic, Peripheral, Service, ValueNotification, WriteType};
 use cipher::{BlockEncrypt, KeyInit};
 use futures::StreamExt;
 use sha2::{Digest, Sha256};
 use tokio::time::timeout;
 use tracing::{debug, error, info};
-use uuid::Uuid;
 
-use crate::app::{ErrorPopup};
 use crate::errors::AppError;
+use crate::heart_rate::constants::BLE_UUIDS;
 use crate::structs::DeviceInfo;
-
-// MiBand UUIDs
-pub const AUTH_SERVICE_UUID: Uuid = 
-    Uuid::from_u128(0x0000fee1_0000_1000_8000_00805f9b34fb); // 0000fee1-0000-1000-8000-00805f9b34fb
-pub const AUTH_CHARACTERISTIC_UUID: Uuid = 
-    Uuid::from_u128(0x00000009_0000_3512_2118_0009af100700); // 00000009-0000-3512-2118-0009af100700
-pub const HEART_RATE_SERVICE_UUID: Uuid = 
-    Uuid::from_u128(0x0000180d_0000_1000_8000_00805f9b34fb); // 0000180d-0000-1000-8000-00805f9b34fb
-pub const HEART_RATE_CONTROL_CHARACTERISTIC_UUID: Uuid = 
-    Uuid::from_u128(0x00002a39_0000_1000_8000_00805f9b34fb); // 00002a39-0000-1000-8000-00805f9b34fb
-pub const HEART_RATE_MEASUREMENT_CHARACTERISTIC_UUID: Uuid = 
-    Uuid::from_u128(0x00002a37_0000_1000_8000_00805f9b34fb); // 00002a37-0000-1000-8000-00805f9b34fb
-pub const SENSOR_SERVICE_UUID: Uuid = 
-    Uuid::from_u128(0x0000fee0_0000_1000_8000_00805f9b34fb); // 0000fee0-0000-1000-8000-00805f9b34fb
-pub const SENSOR_CHARACTERISTIC_UUID: Uuid = 
-    Uuid::from_u128(0x00000001_0000_3512_2118_0009af100700); // 00000001-0000-3512-2118-0009af100700
 
 // Global storage for device authentication keys
 lazy_static::lazy_static! {
     static ref MIBAND_AUTH_KEYS: Arc<Mutex<HashMap<String, Vec<u8>>>> = Arc::new(Mutex::new(HashMap::new()));
 }
 
-/// A struct that represents a MiBand device and encapsulates all MiBand-specific functionality.
 pub struct MiBandDevice {
-    /// The device information
-    pub peripheral: DeviceInfo,
-    /// The model of the MiBand
+    pub device_info: DeviceInfo,
     pub model: MiBandModel,
-    /// The authentication key for the device
     pub auth_key: Option<Vec<u8>>,
+    auth_characteristic: Option<Characteristic>,
+    hr_control_characteristic: Option<Characteristic>,
+    hr_service: Option<Service>
 }
 
 impl MiBandDevice {
     /// Create a new MiBandDevice instance
-    pub fn new(peripheral: DeviceInfo) -> Self {
-        let model = MiBandModel::from_name(&peripheral.name);
+    pub fn new(device_info: DeviceInfo) -> Self {
+        let model = MiBandModel::from_name(&device_info.name);
         
         // Try to get stored auth key for this device
-        let auth_key = get_miband_key(&peripheral.address);
+        let auth_key = get_miband_key(&device_info.address);
         
         Self {
-            peripheral,
+            device_info,
             model,
             auth_key,
+            auth_characteristic: None,
+            hr_control_characteristic: None,
+            hr_service: None,
         }
-    }
-    
-    /// Check if a device is a MiBand
-    pub fn is_miband(name: &str) -> bool {
-        name.contains("Mi Band")
     }
     
     /// Authenticate with the MiBand device
@@ -75,18 +54,29 @@ impl MiBandDevice {
         let services = device.services();
         let auth_service = services
             .iter()
-            .find(|s| s.uuid == AUTH_SERVICE_UUID)
+            .find(|s| s.uuid == BLE_UUIDS.services.mi_band.auth)
             .ok_or_else(|| AppError::Bt(btleplug::Error::NotSupported("MiBand auth service not found".into())))?;
         
         // Get the auth characteristic
-        let auth_char = auth_service
+        self.auth_characteristic = Some(auth_service
             .characteristics
             .iter()
-            .find(|c| c.uuid == AUTH_CHARACTERISTIC_UUID)
-            .ok_or_else(|| AppError::Bt(btleplug::Error::NotSupported("MiBand auth characteristic not found".into())))?;
+            .find(|c| c.uuid == BLE_UUIDS.characteristics.mi_band.auth)
+            .ok_or_else(|| AppError::Bt(btleplug::Error::NotSupported("MiBand auth characteristic not found".into())))?.clone());
+        
+        self.hr_service = Some(services
+            .iter()
+            .find(|s| s.uuid == BLE_UUIDS.services.heart_rate)
+            .ok_or_else(|| AppError::Bt(btleplug::Error::NotSupported("HR service not found".into())))?.clone());
+        
+        self.hr_control_characteristic = Some(self.hr_service.as_ref().unwrap()
+            .characteristics
+            .iter()
+            .find(|c| c.uuid == BLE_UUIDS.characteristics.heart_rate.control)
+            .ok_or_else(|| AppError::Bt(btleplug::Error::NotSupported("HR control characteristic not found".into())))?.clone());
         
         // Subscribe to notifications
-        device.subscribe(auth_char).await?;
+        device.subscribe(self.auth_characteristic.as_ref().unwrap()).await?;
         
         match self.model {
             MiBandModel::MiBand2 | MiBandModel::MiBand3 => {
@@ -99,33 +89,35 @@ impl MiBandDevice {
                     self.auth_key = Some(key);
                 }
                 
+                debug!("Using auth key: {:x?}", self.auth_key);
+                
                 // Create a notification stream
                 let mut notification_stream = device.notifications().await?;
                 
                 // Store the key for future use
                 if let Some(key) = &self.auth_key {
-                    save_miband_key(&self.peripheral.address, key);
+                    save_miband_key(&self.device_info.address, key);
                 }
                 
                 // Send auth request with key
                 let mut request = vec![0x01, 0x08];
                 request.extend_from_slice(&self.auth_key.clone().unwrap());
-                device.write(auth_char, &request, WriteType::WithoutResponse).await?;
+                device.write(self.auth_characteristic.as_ref().unwrap(), &request, WriteType::WithoutResponse).await?;
                 
                 // Authentication state machine
                 let auth_timeout = Duration::from_secs(10); // Adjust timeout as needed
                 let mut auth_success = false;
-                
+
                 while let Ok(Some(notification)) = timeout(auth_timeout, notification_stream.next()).await {
-                    if notification.uuid == auth_char.uuid {
+                    if notification.uuid == BLE_UUIDS.characteristics.mi_band.auth {
                         let data = notification.value;
-                        
+
                         match data.get(1) {
                             Some(0x01) => {
                                 if data.get(2) == Some(&0x01) {
                                     // Send request for random number
                                     device.write(
-                                        auth_char,
+                                        self.auth_characteristic.as_ref().unwrap(),
                                         &[0x02, 0x08],
                                         WriteType::WithoutResponse
                                     ).await?;
@@ -138,12 +130,12 @@ impl MiBandDevice {
                                     // Got random number, encrypt and send response
                                     let random_number = &data[3..];
                                     let encrypted = self.encrypt_random_number(random_number);
-                                    
+
                                     let mut response = vec![0x03, 0x08];
                                     response.extend_from_slice(&encrypted);
-                                    
+
                                     device.write(
-                                        auth_char,
+                                        self.auth_characteristic.as_ref().unwrap(),
                                         &response,
                                         WriteType::WithoutResponse
                                     ).await?;
@@ -161,10 +153,10 @@ impl MiBandDevice {
                         }
                     }
                 }
-                
+
                 // Clean up notifications
-                device.unsubscribe(auth_char).await?;
-                
+                //device.unsubscribe(self.auth_characteristic.as_ref().unwrap()).await?;
+
                 if auth_success {
                     Ok(true)
                 } else {
@@ -178,7 +170,7 @@ impl MiBandDevice {
                 }
                 
                 // Send auth request
-                device.write(auth_char, &[0x02, 0x00], WriteType::WithoutResponse).await?;
+                device.write(self.auth_characteristic.as_ref().unwrap(), &[0x02, 0x00], WriteType::WithoutResponse).await?;
                 
                 // This is a placeholder - MiBand 4/5 authentication is not fully implemented
                 // In a real implementation, we would need to set up a notification handler and process the responses
@@ -214,33 +206,16 @@ impl MiBandDevice {
         let services = device.services();
         
         // Set up sensor
-        if let Some(sensor_service) = services.iter().find(|s| s.uuid == SENSOR_SERVICE_UUID) {
-            if let Some(sensor_char) = sensor_service.characteristics.iter().find(|c| c.uuid == SENSOR_CHARACTERISTIC_UUID) {
+        if let Some(sensor_service) = services.iter().find(|s| s.uuid == BLE_UUIDS.services.mi_band.sensor) {
+            if let Some(sensor_char) = sensor_service.characteristics.iter().find(|c| c.uuid == BLE_UUIDS.characteristics.mi_band.sensor) {
                 device.write(sensor_char, &[0x01, 0x03, 0x19], WriteType::WithoutResponse).await?;
             }
         }
-        
-        // Set up heart rate monitoring
-        if let Some(hr_service) = services.iter().find(|s| s.uuid == HEART_RATE_SERVICE_UUID) {
-            // Subscribe to heart rate notifications
-            if let Some(hr_notify_char) = hr_service.characteristics.iter().find(|c| c.uuid == HEART_RATE_MEASUREMENT_CHARACTERISTIC_UUID) {
-                device.subscribe(hr_notify_char).await?;
-            } else {
-                return Err(AppError::Bt(btleplug::Error::NotSupported("Heart rate measurement characteristic not found".into())));
-            }
-            
-            // Configure heart rate monitoring
-            if let Some(hr_control_char) = hr_service.characteristics.iter().find(|c| c.uuid == HEART_RATE_CONTROL_CHARACTERISTIC_UUID) {
-                if continuous {
-                    device.write(hr_control_char, &[0x15, 0x01, 0x01], WriteType::WithoutResponse).await?;
-                } else {
-                    device.write(hr_control_char, &[0x15, 0x02, 0x01], WriteType::WithoutResponse).await?;
-                }
-            } else {
-                return Err(AppError::Bt(btleplug::Error::NotSupported("Heart rate control characteristic not found".into())));
-            }
+
+        if continuous {
+            device.write(self.hr_control_characteristic.as_ref().unwrap(), &[0x15, 0x01, 0x01], WriteType::WithoutResponse).await?;
         } else {
-            return Err(AppError::Bt(btleplug::Error::NotSupported("Heart rate service not found".into())));
+            device.write(self.hr_control_characteristic.as_ref().unwrap(), &[0x15, 0x02, 0x01], WriteType::WithoutResponse).await?;
         }
         
         Ok(())
@@ -248,16 +223,8 @@ impl MiBandDevice {
     
     /// Stop heart rate monitoring on the MiBand device
     pub async fn stop_heart_rate_monitor(&self, device: &impl Peripheral) -> Result<(), AppError> {
-        // Get the heart rate service
-        let services = device.services();
-        
-        // Stop heart rate monitoring
-        if let Some(hr_service) = services.iter().find(|s| s.uuid == HEART_RATE_SERVICE_UUID) {
-            if let Some(hr_control_char) = hr_service.characteristics.iter().find(|c| c.uuid == HEART_RATE_CONTROL_CHARACTERISTIC_UUID) {
-                device.write(hr_control_char, &[0x15, 0x01, 0x00], WriteType::WithoutResponse).await?;
-                device.write(hr_control_char, &[0x15, 0x02, 0x00], WriteType::WithoutResponse).await?;
-            }
-        }
+        device.write(self.hr_control_characteristic.as_ref().unwrap(), &[0x15, 0x01, 0x00], WriteType::WithoutResponse).await?;
+        device.write(self.hr_control_characteristic.as_ref().unwrap(), &[0x15, 0x02, 0x00], WriteType::WithoutResponse).await?;
         
         Ok(())
     }
@@ -267,31 +234,18 @@ impl MiBandDevice {
         if notification.value.len() < 3 {
             return Ok(());
         }
-        
+
         let cmd_type = notification.value[0];
         let status = notification.value[1];
         let req_type = notification.value[2];
-        
-        // Find the auth characteristic
-        let services = device.services();
-        let auth_service = services
-            .iter()
-            .find(|s| s.uuid == AUTH_SERVICE_UUID)
-            .ok_or_else(|| AppError::Bt(btleplug::Error::NotSupported("MiBand auth service not found".into())))?;
-        
-        let auth_char = auth_service
-            .characteristics
-            .iter()
-            .find(|c| c.uuid == AUTH_CHARACTERISTIC_UUID)
-            .ok_or_else(|| AppError::Bt(btleplug::Error::NotSupported("MiBand auth characteristic not found".into())))?;
-        
+
         match (cmd_type, status) {
             // MiBand 2/3 authentication
             (0x10, 0x01) => {
                 if req_type == 0x01 {
                     // Request for random number
                     device.write(
-                        auth_char,
+                        self.auth_characteristic.as_ref().unwrap(),
                         &[0x02, 0x08],
                         WriteType::WithoutResponse,
                     ).await?;
@@ -305,16 +259,16 @@ impl MiBandDevice {
                     error!("Invalid random number length");
                     return Ok(());
                 }
-                
+
                 if let Some(key) = &self.auth_key {
                     let random_number = &notification.value[3..19];
                     let encrypted = encrypt_auth_number(random_number, key);
-                    
+
                     let mut response = vec![0x03, 0x08];
                     response.extend_from_slice(&encrypted);
-                    
+
                     device.write(
-                        auth_char,
+                        self.auth_characteristic.as_ref().unwrap(),
                         &response,
                         WriteType::WithoutResponse,
                     ).await?;
@@ -329,12 +283,12 @@ impl MiBandDevice {
                     error!("Authentication failed (3)");
                 }
             }
-            
+
             // MiBand 4/5 authentication
             (0x01, 0x01) => {
                 if req_type == 0x01 {
                     device.write(
-                        auth_char,
+                        self.auth_characteristic.as_ref().unwrap(),
                         &[0x02, 0x08],
                         WriteType::WithoutResponse,
                     ).await?;
@@ -348,16 +302,16 @@ impl MiBandDevice {
                     error!("Invalid random number length");
                     return Ok(());
                 }
-                
+
                 if let Some(key) = &self.auth_key {
                     let random_number = &notification.value[3..19];
                     let encrypted = encrypt_auth_number(random_number, key);
-                    
+
                     let mut response = vec![0x03, 0x00];
                     response.extend_from_slice(&encrypted);
-                    
+
                     device.write(
-                        auth_char,
+                        self.auth_characteristic.as_ref().unwrap(),
                         &response,
                         WriteType::WithoutResponse,
                     ).await?;
@@ -372,7 +326,7 @@ impl MiBandDevice {
                     error!("Authentication failed (3)");
                 }
             }
-            
+
             _ => {
                 debug!("Unknown auth notification: {:?}", notification.value);
             }
@@ -469,3 +423,4 @@ pub fn encrypt_auth_number(number: &[u8], key: &[u8]) -> Vec<u8> {
     // Convert back to bytes
     blocks.iter().flat_map(|block| block.iter().cloned()).collect()
 }
+

@@ -22,7 +22,6 @@ use crate::activities::Activities;
 use crate::args::{SubCommands, TopLevelCmd};
 use crate::broadcast;
 use crate::errors::AppError;
-use crate::heart_rate::ble::HEART_RATE_SERVICE_UUID;
 use crate::heart_rate::dummy::dummy_thread;
 use crate::heart_rate::websocket::websocket_thread;
 use crate::logging::prometheus_logging_thread;
@@ -42,6 +41,7 @@ use crate::{
         CHART_BPM_MAX_ELEMENTS, CHART_BPM_VERT_MARGIN, CHART_RR_MAX_ELEMENTS, CHART_RR_VERT_MARGIN,
     },
 };
+use crate::heart_rate::constants::BLE_UUIDS;
 
 pub enum AppRx {
     DeviceUpdate(DeviceUpdate),
@@ -1195,7 +1195,7 @@ impl App {
                     // (We don't use the ScanFilter from btleplug to allow quicker connection to saved devices,
                     // and since it reports only "Unknown" names for some reason)
                     // TODO: Raise issue about it
-                    if device.services.contains(&HEART_RATE_SERVICE_UUID) {
+                    if device.services.contains(&BLE_UUIDS.services.heart_rate) {
                         self.discovered_devices.push(device.clone());
                     }
                     // This filter used to be in scan.rs, but doing it here
