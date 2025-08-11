@@ -17,7 +17,7 @@ use tokio::task::JoinHandle;
 use tokio::time::timeout;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info};
-
+use uuid::Uuid;
 use crate::activities::Activities;
 use crate::args::{SubCommands, TopLevelCmd};
 use crate::broadcast;
@@ -41,7 +41,7 @@ use crate::{
         CHART_BPM_MAX_ELEMENTS, CHART_BPM_VERT_MARGIN, CHART_RR_MAX_ELEMENTS, CHART_RR_VERT_MARGIN,
     },
 };
-use crate::heart_rate::constants::BLE_UUIDS;
+use crate::heart_rate::constants::ble_uuids;
 
 pub enum AppRx {
     DeviceUpdate(DeviceUpdate),
@@ -1195,7 +1195,7 @@ impl App {
                     // (We don't use the ScanFilter from btleplug to allow quicker connection to saved devices,
                     // and since it reports only "Unknown" names for some reason)
                     // TODO: Raise issue about it
-                    if device.services.contains(&BLE_UUIDS.services.heart_rate) {
+                    if device.services.contains(&Uuid::from(ble_uuids::service::HEART_RATE)) {
                         self.discovered_devices.push(device.clone());
                     }
                     // This filter used to be in scan.rs, but doing it here

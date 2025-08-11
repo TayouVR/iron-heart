@@ -9,9 +9,9 @@ use futures::StreamExt;
 use sha2::{Digest, Sha256};
 use tokio::time::timeout;
 use tracing::{debug, error, info};
-
+use uuid::Uuid;
 use crate::errors::AppError;
-use crate::heart_rate::constants::BLE_UUIDS;
+use crate::heart_rate::constants::ble_uuids;
 use crate::structs::DeviceInfo;
 
 // Global storage for device authentication keys
@@ -54,25 +54,25 @@ impl MiBandDevice {
         let services = device.services();
         let auth_service = services
             .iter()
-            .find(|s| s.uuid == BLE_UUIDS.services.mi_band.auth)
+            .find(|s| s.uuid == ble_uuids::service::MIBAND_AUTH)
             .ok_or_else(|| AppError::Bt(btleplug::Error::NotSupported("MiBand auth service not found".into())))?;
         
         // Get the auth characteristic
         self.auth_characteristic = Some(auth_service
             .characteristics
             .iter()
-            .find(|c| c.uuid == BLE_UUIDS.characteristics.mi_band.auth)
+            .find(|c| c.uuid == ble_uuids::characteristic::MIBAND_AUTH)
             .ok_or_else(|| AppError::Bt(btleplug::Error::NotSupported("MiBand auth characteristic not found".into())))?.clone());
         
         self.hr_service = Some(services
             .iter()
-            .find(|s| s.uuid == BLE_UUIDS.services.heart_rate)
+            .find(|s| s.uuid == Uuid::from(ble_uuids::service::HEART_RATE))
             .ok_or_else(|| AppError::Bt(btleplug::Error::NotSupported("HR service not found".into())))?.clone());
         
         self.hr_control_characteristic = Some(self.hr_service.as_ref().unwrap()
             .characteristics
             .iter()
-            .find(|c| c.uuid == BLE_UUIDS.characteristics.heart_rate.control)
+            .find(|c| c.uuid == Uuid::from(ble_uuids::characteristic::HEART_RATE_CONTROL_POINT))
             .ok_or_else(|| AppError::Bt(btleplug::Error::NotSupported("HR control characteristic not found".into())))?.clone());
         
         // Subscribe to notifications
@@ -109,7 +109,7 @@ impl MiBandDevice {
                 let mut auth_success = false;
 
                 while let Ok(Some(notification)) = timeout(auth_timeout, notification_stream.next()).await {
-                    if notification.uuid == BLE_UUIDS.characteristics.mi_band.auth {
+                    if notification.uuid == ble_uuids::characteristic::MIBAND_AUTH {
                         let data = notification.value;
 
                         match data.get(1) {
@@ -206,8 +206,8 @@ impl MiBandDevice {
         let services = device.services();
         
         // Set up sensor
-        if let Some(sensor_service) = services.iter().find(|s| s.uuid == BLE_UUIDS.services.mi_band.sensor) {
-            if let Some(sensor_char) = sensor_service.characteristics.iter().find(|c| c.uuid == BLE_UUIDS.characteristics.mi_band.sensor) {
+        if let Some(sensor_service) = services.iter().find(|s| s.uuid == ble_uuids::service::MIBAND_SENSOR) {
+            if let Some(sensor_char) = sensor_service.characteristics.iter().find(|c| c.uuid == ble_uuids::characteristic::MIBAND_SENSOR) {
                 device.write(sensor_char, &[0x01, 0x03, 0x19], WriteType::WithoutResponse).await?;
             }
         }

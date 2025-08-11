@@ -1,4 +1,4 @@
-use super::{constants::BLE_UUIDS, BatteryLevel, HeartRateStatus};
+use super::{BatteryLevel, HeartRateStatus};
 use crate::app::{AppUpdate, ErrorPopup};
 use crate::errors::AppError;
 use crate::structs::DeviceInfo;
@@ -11,9 +11,9 @@ use tokio::sync::broadcast::Sender as BSender;
 use tokio::sync::mpsc::Sender;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
-
+use uuid::Uuid;
 use crate::broadcast;
-
+use crate::heart_rate::constants::ble_uuids;
 use super::measurement::parse_hrm;
 use super::miband::{self, MiBandDevice};
 use super::twitcher::Twitcher;
@@ -67,7 +67,7 @@ impl BleMonitorActor {
                             // Save battery characteristic if present
                             if let Some(characteristic) = characteristics
                                 .iter()
-                                .find(|c| c.uuid == BLE_UUIDS.characteristics.battery_level)
+                                .find(|c| c.uuid == Uuid::from(ble_uuids::characteristic::BATTERY_LEVEL))
                             {
                                 self.battery_characteristic = Some(characteristic.to_owned());
                                 self.get_monitor_battery(&peripheral).await;
@@ -100,7 +100,7 @@ impl BleMonitorActor {
                             // Subscribe to heart rate notifications
                             if let Some(characteristic) = characteristics
                                 .iter()
-                                .find(|c| c.uuid == BLE_UUIDS.characteristics.heart_rate.measurement)
+                                .find(|c| c.uuid == Uuid::from(ble_uuids::characteristic::HEART_RATE_MEASUREMENT))
                             {
                                 if peripheral.subscribe(characteristic).await.is_err() {
                                     error!("Failed to subscribe to HR service!");
@@ -188,7 +188,7 @@ impl BleMonitorActor {
                 Some(data) = notification_stream.next() => {
                     last_packet = std::time::Instant::now();
 
-                    if data.uuid == BLE_UUIDS.characteristics.heart_rate.measurement {
+                    if data.uuid == Uuid::from(ble_uuids::characteristic::HEART_RATE_MEASUREMENT) {
                         let hr = self.handle_ble_hr(&data);
                         broadcast!(broadcast_tx, hr);
                     }
